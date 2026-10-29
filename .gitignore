@@ -12,6 +12,9 @@ build/
 # 编译产物 / 安装器 / 便携版（约 340MB）
 desktop/build/
 
+# ---- AppImage 打包工具（appimage-package.sh 首次运行自动下载，解压后约 300MB）----
+tools/appimagetool/
+
 # ---- 打包产物（重跑 portable-package.ps1 / installer-package.ps1 即可再生成）----
 # 便携版 app-image 与 zip（约 590MB）
 release/
@@ -56,3 +59,6 @@ yunx_log_*.txt
 #     它来自 material 1.14.0 AAR 解包，Maven 上无同名坐标，必须随仓库提交。
 # gradle/wrapper/gradle-wrapper.jar + gradlew + gradlew.bat —— Gradle Wrapper，必须提交。
 # gradle.properties / settings.gradle.kts / build.gradle.kts —— 构建配置，必须提交。
+
+# ---- AI shell 本地会话/计划目录 ----
+.aish/

@@ -1,9 +1,28 @@
+import org.gradle.internal.os.OperatingSystem
 import org.jetbrains.compose.desktop.application.dsl.TargetFormat
 
 plugins {
     kotlin("jvm")
     id("org.jetbrains.compose")
     id("org.jetbrains.kotlin.plugin.compose")
+}
+
+// ---- 目标平台 ----
+// Windows 仍是主发布目标；Linux / macOS 走同一套源码，差异集中在下面几处依赖与
+// 各文件里的 Platform 分支（见 desktop/src/main/kotlin/com/yunx/app/util/Platform.kt）。
+val hostOs = OperatingSystem.current()
+val isWindows = hostOs.isWindows
+val isLinux = hostOs.isLinux
+val isMac = hostOs.isMacOsX
+
+/** JCEF 原生库版本：各平台 artifact 版本号完全一致，只有 group 里的平台后缀不同 */
+val jcefNativesVersion = "jcef-1770317+cef-132.3.1+g144febe+chromium-132.0.6834.83"
+
+/** JavaFX 分类器（jar 内含该平台原生库） */
+val javafxClassifier = when {
+    isWindows -> "win"
+    isLinux -> "linux"
+    else -> "mac"
 }
 
 dependencies {
@@ -26,21 +45,27 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-swing:1.9.0")
 
     // Room -> 纯 JDBC SQLite
-    // ★ 用裁剪后的本地 jar：官方包 13.6 MB，含六个平台的原生库，本项目只跑 Windows。
-    //   只保留 org/sqlite/native/Windows（x86/x86_64/arm/arm64），其余代码与 META-INF 原样保留。
-    implementation(files("libs/sqlite-jdbc-3.47.1.0-win.jar"))
+    // ★ Windows 用裁剪后的本地 jar：官方包 13.6 MB，含六个平台的原生库，Windows 包只需要
+    //   org/sqlite/native/Windows（x86/x86_64/arm/arm64），其余代码与 META-INF 原样保留。
+    //   非 Windows 直接用官方坐标（Linux 的 jpackage 包会由 jlink 带走，体积影响可接受，
+    //   再裁一份 linux 专用 jar 会让 libs/ 目录多一份维护负担）。
+    if (isWindows) {
+        implementation(files("libs/sqlite-jdbc-3.47.1.0-win.jar"))
+    } else {
+        implementation("org.xerial:sqlite-jdbc:3.47.1.0")
+    }
     // Android 内置 org.json 的 JVM 等价物
     implementation("org.json:json:20240303")
     // 主题种子色（material-color-utilities 无公开仓库坐标；从 material 1.14.0 AAR 解包 classes.jar 本地引入）
     implementation(files("libs/material-color-utilities-1.0.0.jar"))
 
     // JavaFX MediaView 播放器（M6）：JFXPanel 经 SwingPanel 嵌入 Compose。
-    // 版本跟随 jvmToolchain(17)；发布目标只有 Windows，直接用 :win classifier（jar 内含原生库，
+    // 版本跟随 jvmToolchain(17)；按目标平台取对应分类器（jar 内含原生库，
     // 首次运行由 JavaFX 自动解到用户目录缓存，jpackage 无需额外处理）
-    implementation("org.openjfx:javafx-base:17.0.13:win")
-    implementation("org.openjfx:javafx-graphics:17.0.13:win")
-    implementation("org.openjfx:javafx-media:17.0.13:win")
-    implementation("org.openjfx:javafx-swing:17.0.13:win")
+    implementation("org.openjfx:javafx-base:17.0.13:$javafxClassifier")
+    implementation("org.openjfx:javafx-graphics:17.0.13:$javafxClassifier")
+    implementation("org.openjfx:javafx-media:17.0.13:$javafxClassifier")
+    implementation("org.openjfx:javafx-swing:17.0.13:$javafxClassifier")
 
     // GFM Markdown 渲染（README / 更新说明）。注意：必须停留在 0.33.x ——
     // 0.34.0 起改用 Compose 1.8+ 的 BasicText 签名（含 TextAutoSize），与项目锁定的
@@ -71,7 +96,12 @@ dependencies {
     //   发布包不随带这个 120MB 的 jar，改由打包脚本用 JcefNativesPacker 重压成
     //   app\jcef-natives.tar.xz（约 90MB，LZMA2），首次使用时由 JcefNativesInstaller 解开。
     //   见 portable-package.ps1 [2c/5] 与 ui/jcef/JcefNativesInstaller.kt。
-    implementation("me.friwi:jcef-natives-windows-amd64:jcef-1770317+cef-132.3.1+g144febe+chromium-132.0.6834.83")
+    //   Linux 同一版本号的 jcef-natives-linux-amd64 存在，原生库内容不同、装载方式一致。
+    when {
+        isWindows -> implementation("me.friwi:jcef-natives-windows-amd64:$jcefNativesVersion")
+        isLinux -> implementation("me.friwi:jcef-natives-linux-amd64:$jcefNativesVersion")
+        else -> implementation("me.friwi:jcef-natives-macosx-amd64:$jcefNativesVersion")
+    }
 
     // tar.xz 解压/压缩：CEF 原生库发布包（打包期压缩 + 运行期自解包）
     implementation("org.tukaani:xz:1.10")
@@ -150,6 +180,8 @@ tasks.register<JavaExec>("testInProcess") {
 }
 
 // 编译 native/darkmode.cpp → build/native/darkmode.dll（托盘原生菜单暗色桥接层）
+// ★ 仅 Windows：这是 Win32 的 uxtheme 暗色菜单桥接，Linux/macOS 上没有对应物，
+//   DarkMode.enable() 在其它平台直接短路（见 util/DarkMode.kt）。
 val nativeSrcDir = file("native")
 val nativeOutDir = layout.buildDirectory.dir("native").get().asFile
 val darkModeSrc = File(nativeSrcDir, "darkmode.cpp")
@@ -175,43 +207,48 @@ fun findMsvcVcvars(): File? {
     return null
 }
 
-val compileDarkMode by tasks.registering(Exec::class) {
-    val vcvars = findMsvcVcvars()
-    inputs.file(darkModeSrc)
-    outputs.file(darkModeOut)
-    doFirst {
-        nativeOutDir.mkdirs()
-    }
-    if (vcvars != null) {
-        commandLine(
-            "cmd", "/c",
-            "call \"${vcvars.absolutePath}\" >nul && " +
-                "cl /nologo /utf-8 /LD \"${darkModeSrc.absolutePath}\" " +
-                "/Fe:\"${darkModeOut.absolutePath}\" " +
-                "/Fo:\"${nativeOutDir.absolutePath}\\\\\" " +
-                "/link /NOENTRY kernel32.lib user32.lib"
-        )
-    } else {
-        // 回退 MinGW
-        commandLine(
-            "g++", "-shared", "-o", darkModeOut.absolutePath,
-            darkModeSrc.absolutePath, "-lkernel32", "-luser32"
-        )
+if (isWindows) {
+    val compileDarkMode by tasks.registering(Exec::class) {
+        val vcvars = findMsvcVcvars()
+        inputs.file(darkModeSrc)
+        outputs.file(darkModeOut)
+        doFirst {
+            nativeOutDir.mkdirs()
+        }
+        if (vcvars != null) {
+            commandLine(
+                "cmd", "/c",
+                "call \"${vcvars.absolutePath}\" >nul && " +
+                    "cl /nologo /utf-8 /LD \"${darkModeSrc.absolutePath}\" " +
+                    "/Fe:\"${darkModeOut.absolutePath}\" " +
+                    "/Fo:\"${nativeOutDir.absolutePath}\\\\\" " +
+                    "/link /NOENTRY kernel32.lib user32.lib"
+            )
+        } else {
+            // 回退 MinGW
+            commandLine(
+                "g++", "-shared", "-o", darkModeOut.absolutePath,
+                darkModeSrc.absolutePath, "-lkernel32", "-luser32"
+            )
+        }
     }
 }
 
 // 开发运行（:desktop:run）时把 DLL 目录并入 java.library.path，并保留 JDK bin（jawt 等原生库）
+// ★ 分隔符必须用 File.pathSeparator：Windows 是 ';'，Linux/macOS 是 ':'，
+//   写死 ';' 会让 Linux 上整个串被当成一个不存在的路径，JavaFX 的 libglass/libprism 加载不到。
 tasks.withType<JavaExec> {
-    dependsOn(compileDarkMode)
+    if (isWindows) dependsOn("compileDarkMode")
     val jvmBin = File(System.getProperty("java.home"), "bin").absolutePath
-    systemProperty("java.library.path", "${nativeOutDir.absolutePath};$jvmBin")
+    val extraPaths = if (isWindows) "$nativeOutDir${File.pathSeparator}$jvmBin" else jvmBin
+    systemProperty("java.library.path", extraPaths)
 }
 
 // 收集运行时依赖 jar 路径（供便携版 app-image 打包）
 tasks.register("printRuntimeClasspath") {
     doLast {
         val cp = configurations.runtimeClasspath.get().files
-            .joinToString(";") { it.absolutePath }
+            .joinToString(File.pathSeparator) { it.absolutePath }
         println("RUNTIME_CP=$cp")
     }
 }
@@ -234,7 +271,14 @@ compose.desktop {
     application {
         mainClass = "com.yunx.app.MainKt"
         nativeDistributions {
-            targetFormats(TargetFormat.Exe)
+            // Windows 出 exe 安装包；macOS 出 dmg。
+            // Linux 注意：compose-gradle-plugin 1.7.3 的 TargetFormat.AppImage 只是把
+            // jpackage 的 --type 映射成 app-image，产出的是目录而非 .AppImage，
+            // 所以这里不声明该格式；单文件包由 ./gradlew buildAppImage（appimage-package.sh）生成。
+            when {
+                isWindows -> targetFormats(TargetFormat.Exe)
+                isMac -> targetFormats(TargetFormat.Dmg)
+            }
             // sqlite-jdbc 通过反射加载 java.sql.Driver，jlink 自动检测不到，必须显式声明；
             // jdk.httpserver 是视频预览的本地回环代理（com.sun.net.httpserver），
             // jdk.unsupported.desktop 是 JavaFX 与 Swing 互操作（JFXPanel 里的 jdk.swing.interop）——
@@ -244,6 +288,13 @@ compose.desktop {
             windows {
                 perUserInstall = true
             }
+            linux {
+                // AppImage 的图标/桌面项信息：单个 512 图标够用（jpackage 会按需缩放）
+                iconFile.set(project.file("src/main/resources/icon.png"))
+                appCategory = "Network"
+                shortcut = true
+                menuGroup = "Network"
+            }
             packageName = "YunX-Desktop"
             packageVersion = appVersion
             // 注意：jpackage 参数文件解析不支持非 ASCII 描述（本机报 "Input length = 1"），描述保持纯英文
@@ -252,4 +303,22 @@ compose.desktop {
             copyright = "Copyright (C) 2026 tidain"
         }
     }
+}
+
+// ---- Linux 单文件 AppImage ----
+// compose 1.7.3 的 packageAppImage 只会调用 jpackage --type app-image，产出的是目录；
+// 真正的单文件封装交给 appimage-package.sh（首次运行自动下载 appimagetool 到 tools/appimagetool）
+tasks.register<Exec>("buildAppImage") {
+    group = "compose desktop"
+    description = "生成 Linux 单文件 AppImage（release/YunX-Desktop-<version>-<arch>.AppImage）"
+    dependsOn("createDistributable")
+    onlyIf {
+        val supported = isLinux
+        if (!supported) logger.lifecycle("[buildAppImage] 仅支持 Linux 主机，已跳过")
+        supported
+    }
+    workingDir = rootProject.projectDir
+    // 脚本默认自己会调 gradle；此处已由 dependsOn 完成构建，跳过以免重入 daemon
+    environment("YUNX_SKIP_GRADLE", "1")
+    commandLine("bash", rootProject.file("appimage-package.sh").absolutePath)
 }

@@ -5,6 +5,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import com.yunx.app.AppContext
 import com.yunx.app.util.Log
+import com.yunx.app.util.Platform
 import me.friwi.jcefmaven.CefAppBuilder
 import org.cef.CefApp
 import org.cef.CefSettings
@@ -57,6 +58,10 @@ object JcefHolder {
                     }
                     killStaleJcefHelpers()
                     val builder = CefAppBuilder()
+                    // Linux：chrome-sandbox 需要 setuid root，而 AppImage / 用户目录解包出来的
+                    // 一份不可能带这个权限位，setuid 沙箱必然失败，统一换成命名空间沙箱。
+                    // 见 [sandboxArgs] 的说明。
+                    sandboxArgs().forEach { builder.addJcefArgs(it) }
                     val installDir = File(AppContext.cacheDir, "jcef-bundle")
                     builder.setInstallDir(installDir)
                     // 发布包带的是 app\jcef-natives.tar.xz（不含原生 jar）：
@@ -112,17 +117,54 @@ object JcefHolder {
     fun isAvailable(): Boolean = browserReady
 
     /**
+     * Linux 专属的 CEF 沙箱参数（其它平台返回空）。
+     *
+     * 背景：CEF/Chromium 在 Linux 上有两种沙箱 ——
+     * 1. **setuid 沙箱**：`chrome-sandbox` 必须 root 所有且权限 4755。AppImage 解包在
+     *    用户目录下，拿不到 setuid 位（也不该去要），这条路径必然失败；
+     * 2. **命名空间沙箱**：靠 unprivileged user namespace，无需特权。绝大多数发行版可用。
+     *
+     * 所以 Linux 上固定加 `--disable-setuid-sandbox` 走第 2 条；只有命名空间沙箱也不可用
+     * （`unprivileged_userns_clone=0`，常见于部分 Debian/Ubuntu 与容器）或用户显式设置
+     * 环境变量 `YUNX_CEF_NO_SANDBOX=1` 时，才整体关闭沙箱 —— 此时内嵌浏览器仍能工作，
+     * 只是网页进程不再隔离，日志里会明确提示。
+     */
+    private fun sandboxArgs(): List<String> {
+        if (!Platform.isLinux) return emptyList()
+        val args = mutableListOf("--disable-setuid-sandbox")
+        val forced = System.getenv("YUNX_CEF_NO_SANDBOX") == "1"
+        if (forced || !userNamespacesAvailable()) {
+            args += "--no-sandbox"
+            Log.w(
+                TAG,
+                if (forced) "YUNX_CEF_NO_SANDBOX=1，已关闭 CEF 沙箱"
+                else "当前内核禁用非特权 user namespace，回退 --no-sandbox（网页进程不隔离）"
+            )
+        }
+        return args
+    }
+
+    /** 非特权 user namespace 是否可用；读不到 sysctl 时按可用处理（不轻易降级安全） */
+    private fun userNamespacesAvailable(): Boolean {
+        val f = File("/proc/sys/kernel/unprivileged_userns_clone")
+        if (!f.isFile) return true
+        return runCatching { f.readText().trim() != "0" }.getOrDefault(true)
+    }
+
+    /**
      * 清理上次异常退出残留的 CEF 子进程：它们持有缓存目录/配置锁，
      * 不清理会导致下一次 CefInitialize 间歇性失败（"内嵌浏览器经常初始化失败"的根因）。
      * 只杀可执行文件位于本应用 jcef-bundle 目录下的进程，不误伤系统其他 CEF 应用。
      */
     private fun killStaleJcefHelpers() {
         runCatching {
+            // 路径分隔符按平台归一化：Windows 的 ProcessHandle 命令串用 '\'，Linux 用 '/'
+            val sep = if (Platform.isWindows) '\\' else '/'
             val bundleDir = File(AppContext.cacheDir, "jcef-bundle")
-                .canonicalPath.lowercase().replace('/', '\\')
+                .canonicalPath.lowercase().replace('/', sep)
             ProcessHandle.allProcesses().forEach { ph ->
                 runCatching {
-                    val cmd = ph.info().command().orElse("").lowercase().replace('/', '\\')
+                    val cmd = ph.info().command().orElse("").lowercase().replace('/', sep)
                     if (cmd.startsWith(bundleDir)) {
                         Log.w(TAG, "kill stale jcef helper pid=${ph.pid()}: $cmd")
                         ph.destroyForcibly()

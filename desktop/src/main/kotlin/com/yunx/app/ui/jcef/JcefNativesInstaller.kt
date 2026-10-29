@@ -1,12 +1,16 @@
 package com.yunx.app.ui.jcef
 
 import com.yunx.app.util.Log
+import com.yunx.app.util.Platform
+import org.apache.commons.compress.archivers.tar.TarArchiveEntry
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
 import org.tukaani.xz.XZInputStream
 import java.io.BufferedInputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.nio.file.Files
+import java.nio.file.attribute.PosixFilePermission
 
 /**
  * JCEF 原生库的「首次使用自解包」。
@@ -93,7 +97,7 @@ object JcefNativesInstaller {
             TarArchiveInputStream(xz).use { tar ->
                 var written = 0L
                 while (true) {
-                    val entry = tar.nextEntry ?: break
+                    val entry: TarArchiveEntry = tar.nextEntry ?: break
                     val name = entry.name.replace('\\', '/').removePrefix("./")
                     if (name.isBlank() || name == ".") continue
                     val target = File(root, name).canonicalFile
@@ -110,9 +114,42 @@ object JcefNativesInstaller {
                         val copied = tar.copyTo(out, BUFFER_SIZE)
                         written += copied
                     }
+                    // ★ 必须还原权限位：Linux 的 CEF 包里有 chrome_crashpad_handler、
+                    //   jcef_helper 等需要可执行位的子进程，tar 解出来不带权限就是 0644，
+                    //   随后 CefInitialize 会以「无法启动子进程」失败（报错不直观，很难查）。
+                    //   Windows 没有权限位概念，跳过。
+                    applyTarMode(target, entry.mode)
                 }
                 Log.i(TAG, "CEF natives unpacked: ${written / 1024 / 1024} MB")
             }
         }
+    }
+
+    /**
+     * 按 tar 头部记录的权限位设置文件权限（仅 POSIX 平台）。
+     *
+     * 只还原读/写/执行位，忽略 setuid/setgid/sticky —— 从压缩包里解出来的文件
+     * 不该带特权位（CEF 的 chrome-sandbox 就是 4755，这里刻意降级为普通可执行文件，
+     * 沙箱改走 user namespace，见 JcefHolder.sandboxArgs）。
+     */
+    private fun applyTarMode(target: File, mode: Int) {
+        if (Platform.isWindows || mode == 0) return
+        val perms = HashSet<PosixFilePermission>(9)
+        val bits = listOf(
+            0b100000000 to PosixFilePermission.OWNER_READ,
+            0b010000000 to PosixFilePermission.OWNER_WRITE,
+            0b001000000 to PosixFilePermission.OWNER_EXECUTE,
+            0b000100000 to PosixFilePermission.GROUP_READ,
+            0b000010000 to PosixFilePermission.GROUP_WRITE,
+            0b000001000 to PosixFilePermission.GROUP_EXECUTE,
+            0b000000100 to PosixFilePermission.OTHERS_READ,
+            0b000000010 to PosixFilePermission.OTHERS_WRITE,
+            0b000000001 to PosixFilePermission.OTHERS_EXECUTE
+        )
+        for ((bit, perm) in bits) {
+            if (mode and bit != 0) perms += perm
+        }
+        runCatching { Files.setPosixFilePermissions(target.toPath(), perms) }
+            .onFailure { Log.w(TAG, "设置权限失败 ${target.name}: ${it.message}") }
     }
 }
